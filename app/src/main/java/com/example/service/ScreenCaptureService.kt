@@ -31,6 +31,10 @@ import com.example.data.db.TrainingSessionEntity
 import com.example.domain.physics.PhysicsEstimator
 import com.example.domain.physics.PoolPhysicsSimulator
 import com.example.domain.rl.BotAction
+import com.example.domain.vision.AimFeedbackStatus
+import com.example.domain.vision.AssignedSuit
+import com.example.domain.vision.BallSuit
+import com.example.domain.vision.LockedTableGeometry
 import com.example.domain.vision.PoolFrameAnalysis
 import com.example.domain.vision.PoolVisionAnalyzer
 import com.example.domain.vision.ScreenFrameAnalyzer
@@ -45,6 +49,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
@@ -92,6 +97,10 @@ class ScreenCaptureService : Service() {
     private var staleFrames = 0
     private var humanPreShotAnalysis: PoolFrameAnalysis? = null
     private val sessionFailedShotPenalties = ConcurrentHashMap<String, Float>()
+    private var lockedTableGeometry: LockedTableGeometry? = null
+    private var lastObservedUnlockSignal = 0L
+    private var sessionConfirmedSuit: AssignedSuit? = null
+    private val blockedForbiddenTargets = mutableListOf<Pair<Float, Float>>()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -273,7 +282,22 @@ class ScreenCaptureService : Service() {
             imageReader = newReader
             currentCaptureW = captureW
             currentCaptureH = captureH
-            BotServiceBridge.appendLog("Adapted capture buffer to ${captureW}x${captureH}.")
+            lockedTableGeometry = null
+            BotServiceBridge.updatePoolObservation(
+                visionGrid = BotServiceBridge.telemetry.value.latestVisionGrid,
+                stateHash = BotServiceBridge.telemetry.value.latestStateHash,
+                isMyTurn = false,
+                targetsCount = 0,
+                cueX = null,
+                cueY = null,
+                targetX = null,
+                targetY = null,
+                pocketId = null,
+                summary = "Screen rotated (${captureW}x${captureH}) — unlocking table bounds...",
+                isTableLocked = false,
+                tableLockLabel = "Re-locking (${captureW}x${captureH})..."
+            )
+            BotServiceBridge.appendLog("Screen rotated/resized (${captureW}x${captureH}) — auto re-detecting table.")
         } catch (_: Exception) {
         }
     }
@@ -292,6 +316,9 @@ class ScreenCaptureService : Service() {
             lastAction = null
             humanPreShotAnalysis = null
             sessionFailedShotPenalties.clear()
+            lockedTableGeometry = null
+            sessionConfirmedSuit = null
+            blockedForbiddenTargets.clear()
             if (initialProfile != null) {
                 BotServiceBridge.setHumanShotsObserved(initialProfile.humanShotsObserved)
             }
@@ -361,15 +388,59 @@ class ScreenCaptureService : Service() {
         val telemetry = BotServiceBridge.telemetry.value
         val effectiveSeat = (telemetry.manualSeatSideOverride ?: profile.botSeatSide).uppercase()
 
+        if (telemetry.unlockTableSignal != lastObservedUnlockSignal) {
+            lastObservedUnlockSignal = telemetry.unlockTableSignal
+            lockedTableGeometry = null
+        }
+
+        // Auto-unlock if screen rotated or capture resolution changed
+        val currentLock = lockedTableGeometry
+        if (currentLock != null && (currentLock.captureW != bitmap.width || currentLock.captureH != bitmap.height)) {
+            lockedTableGeometry = null
+            BotServiceBridge.appendLog("Orientation/size changed -> auto re-detecting table.")
+        }
+
+        // Respect manual suit override first; otherwise use aim/HUD-locked match suit when clear
+        val activeSuitOverride = when {
+            telemetry.manualSuitOverride in listOf("SOLIDS", "STRIPES") -> telemetry.manualSuitOverride
+            sessionConfirmedSuit == AssignedSuit.SOLIDS || sessionConfirmedSuit == AssignedSuit.STRIPES -> sessionConfirmedSuit!!.name
+            else -> telemetry.manualSuitOverride
+        }
+
         BotServiceBridge.setCaptureSizeLabel("${bitmap.width}x${bitmap.height}")
         val analysis = PoolVisionAnalyzer.analyze(
             bitmap = bitmap,
             profile = profile,
             seatOverride = telemetry.manualSeatSideOverride,
-            suitOverride = telemetry.manualSuitOverride,
-            failedShotPenalties = sessionFailedShotPenalties
+            suitOverride = activeSuitOverride,
+            failedShotPenalties = sessionFailedShotPenalties,
+            lockedTable = lockedTableGeometry,
+            blockedTargetsIso = blockedForbiddenTargets
         )
         bitmap.recycle()
+
+        // Lock table bounds once on first valid detection
+        if (lockedTableGeometry == null && analysis.detectedGeometry != null) {
+            lockedTableGeometry = analysis.detectedGeometry
+            BotServiceBridge.appendLog(
+                "Table size LOCKED (${bitmap.width}x${bitmap.height}) — fixed until screen rotates."
+            )
+        }
+
+        // Reset match-scoped suit lock on fresh break rack
+        if (analysis.botRackCount == 0 && analysis.oppRackCount == 0 && analysis.allTableTargets.size >= 14) {
+            sessionConfirmedSuit = null
+            blockedForbiddenTargets.clear()
+        } else if (sessionConfirmedSuit == null &&
+            analysis.detectedSuit in listOf(AssignedSuit.SOLIDS, AssignedSuit.STRIPES) &&
+            analysis.botRackCount in 1..7 && analysis.oppRackCount in 1..7
+        ) {
+            sessionConfirmedSuit = analysis.detectedSuit
+        }
+
+        if (!analysis.isMyTurn && blockedForbiddenTargets.isNotEmpty()) {
+            blockedForbiddenTargets.clear()
+        }
 
         BotServiceBridge.setHumanShotsObserved(profile.humanShotsObserved)
 
@@ -399,6 +470,12 @@ class ScreenCaptureService : Service() {
             else -> "WAIT / ROLLING"
         }
 
+        val tableLockLabel = if (lockedTableGeometry != null) {
+            "LOCKED (${bitmap.width}x${bitmap.height})"
+        } else {
+            "Scanning table..."
+        }
+
         BotServiceBridge.updatePoolObservation(
             visionGrid = analysis.visionGrid,
             stateHash = shot?.stateHash ?: "POOL_SCANNING",
@@ -415,7 +492,9 @@ class ScreenCaptureService : Service() {
             turnOwnerLabel = turnOwnerLabel,
             detectedSuitLabel = analysis.detectedSuit.name,
             effectiveSuitLabel = analysis.effectiveSuit.name,
-            simulationSummary = analysis.simulationPrediction?.summaryText ?: "Scanning table..."
+            simulationSummary = analysis.simulationPrediction?.summaryText ?: "Scanning table...",
+            isTableLocked = lockedTableGeometry != null,
+            tableLockLabel = tableLockLabel
         )
 
         val a11y = GameBotAccessibilityService.instance
@@ -445,8 +524,9 @@ class ScreenCaptureService : Service() {
                         bitmap = postBmp,
                         profile = profile,
                         seatOverride = telemetry.manualSeatSideOverride,
-                        suitOverride = telemetry.manualSuitOverride,
-                        failedShotPenalties = sessionFailedShotPenalties
+                        suitOverride = activeSuitOverride,
+                        failedShotPenalties = sessionFailedShotPenalties,
+                        lockedTable = lockedTableGeometry
                     )
                     postBmp.recycle()
                     parsed
@@ -573,7 +653,93 @@ class ScreenCaptureService : Service() {
 
         // 1. Tap along the isotropic ghost-ball ray on table felt to orient the cue stick accurately
         a11y.dispatchNormalizedTapAwait(aimX, aimY, holdMs = 55L)
-        delay(240L)
+        delay(260L)
+
+        // 1b. Live Aim Check: Inspect Red ⊘ (NOT my ball) vs White aiming ring & guideline (IS my ball & aim on target)
+        val aimCheckBmp = captureLatestBitmap()
+        if (aimCheckBmp != null) {
+            val feedback = PoolVisionAnalyzer.inspectAimFeedback(
+                bitmap = aimCheckBmp,
+                cueBall = shot.cueBall,
+                targetBall = shot.targetBall,
+                intendedPocket = shot.pocket,
+                aspectRatio = analysis.aspectRatio
+            )
+            aimCheckBmp.recycle()
+
+            when (feedback.status) {
+                AimFeedbackStatus.FORBIDDEN_RED_MARKER -> {
+                    BotServiceBridge.updateAimFeedback("RED ⊘ NOT MY BALL")
+                    BotServiceBridge.appendLog(
+                        "Aim Guard: ${feedback.note} on ${shot.targetBall.colorTag} ${shot.targetBall.suit.name} -> switching target!"
+                    )
+                    blockedForbiddenTargets.add(shot.targetBall.normX to shot.targetBall.normY)
+                    if (telemetry.manualSuitOverride !in listOf("SOLIDS", "STRIPES")) {
+                        when (shot.targetBall.suit) {
+                            BallSuit.SOLID -> sessionConfirmedSuit = AssignedSuit.STRIPES
+                            BallSuit.STRIPE -> sessionConfirmedSuit = AssignedSuit.SOLIDS
+                            else -> Unit
+                        }
+                    }
+                    return
+                }
+                AimFeedbackStatus.CONFIRMED_LEGAL_WHITE_GUIDE -> {
+                    BotServiceBridge.updateAimFeedback("WHITE GUIDE ✓ (${shot.targetBall.suit.name})")
+                    if (sessionConfirmedSuit == null && telemetry.manualSuitOverride !in listOf("SOLIDS", "STRIPES")) {
+                        when (shot.targetBall.suit) {
+                            BallSuit.SOLID -> sessionConfirmedSuit = AssignedSuit.SOLIDS
+                            BallSuit.STRIPE -> sessionConfirmedSuit = AssignedSuit.STRIPES
+                            else -> Unit
+                        }
+                    }
+                    // Micro-trim cue stick if white guide line is slightly off pocket line
+                    if (!forceManualShot && abs(feedback.guideAngleErrorDeg) in 2.5f..18f) {
+                        val (adjX, adjY) = PoolVisionAnalyzer.computeAimPointWithTrim(
+                            shot = shot,
+                            angleTrimDeg = combinedTrimDeg - feedback.guideAngleErrorDeg * 0.45f,
+                            aspectRatio = analysis.aspectRatio,
+                            fLeft = fL,
+                            fTop = fT,
+                            fRight = fR,
+                            fBottom = fB
+                        )
+                        a11y.dispatchNormalizedTapAwait(adjX, adjY, holdMs = 45L)
+                        delay(180L)
+                    }
+                }
+                AimFeedbackStatus.NO_CLEAR_AIM_FEEDBACK -> {
+                    BotServiceBridge.updateAimFeedback("Re-aiming onto ball...")
+                    a11y.dispatchNormalizedTapAwait(aimX, aimY, holdMs = 55L)
+                    delay(220L)
+                    val recheckBmp = captureLatestBitmap()
+                    if (recheckBmp != null) {
+                        val recheck = PoolVisionAnalyzer.inspectAimFeedback(
+                            bitmap = recheckBmp,
+                            cueBall = shot.cueBall,
+                            targetBall = shot.targetBall,
+                            intendedPocket = shot.pocket,
+                            aspectRatio = analysis.aspectRatio
+                        )
+                        recheckBmp.recycle()
+                        if (recheck.status == AimFeedbackStatus.FORBIDDEN_RED_MARKER) {
+                            BotServiceBridge.updateAimFeedback("RED ⊘ NOT MY BALL")
+                            BotServiceBridge.appendLog("Aim Guard (2nd check): Red ⊘ -> NOT my ball! Aborting shot.")
+                            blockedForbiddenTargets.add(shot.targetBall.normX to shot.targetBall.normY)
+                            if (telemetry.manualSuitOverride !in listOf("SOLIDS", "STRIPES")) {
+                                when (shot.targetBall.suit) {
+                                    BallSuit.SOLID -> sessionConfirmedSuit = AssignedSuit.STRIPES
+                                    BallSuit.STRIPE -> sessionConfirmedSuit = AssignedSuit.SOLIDS
+                                    else -> Unit
+                                }
+                            }
+                            return
+                        } else if (recheck.status == AimFeedbackStatus.CONFIRMED_LEGAL_WHITE_GUIDE) {
+                            BotServiceBridge.updateAimFeedback("WHITE GUIDE ✓ (${shot.targetBall.suit.name})")
+                        }
+                    }
+                }
+            }
+        }
 
         // 2. Pull the left vertical cue power slider down proportionally to Shot Force and release to fire
         val startBarY = (profile.powerBarTopY + 0.045f).coerceIn(0.24f, 0.42f)
@@ -614,8 +780,9 @@ class ScreenCaptureService : Service() {
                 bitmap = postBitmap,
                 profile = profile,
                 seatOverride = telemetry.manualSeatSideOverride,
-                suitOverride = telemetry.manualSuitOverride,
-                failedShotPenalties = sessionFailedShotPenalties
+                suitOverride = activeSuitOverride,
+                failedShotPenalties = sessionFailedShotPenalties,
+                lockedTable = lockedTableGeometry
             )
             postBitmap.recycle()
             postAnalysis = parsedPost

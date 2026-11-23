@@ -48,6 +48,10 @@ data class LiveBotTelemetry(
     val simulationSummary: String = "No shot prediction yet",
     val ballsTrackedCount: Int = 0,
     val avgPredictionError: Float = 0f,
+    val isTableLocked: Boolean = false,
+    val tableLockLabel: String = "Scanning table...",
+    val aimFeedbackLabel: String = "Idle",
+    val unlockTableSignal: Long = 0L,
     val liveLogLines: List<String> = emptyList()
 )
 
@@ -121,6 +125,21 @@ object BotServiceBridge {
         }
     }
 
+    fun requestTableUnlock() {
+        _telemetry.update {
+            it.copy(
+                unlockTableSignal = System.currentTimeMillis(),
+                isTableLocked = false,
+                tableLockLabel = "Re-scanning table..."
+            )
+        }
+        appendLog("Table lock cleared — re-scanning table on next frame.")
+    }
+
+    fun updateAimFeedback(label: String) {
+        _telemetry.update { it.copy(aimFeedbackLabel = label) }
+    }
+
     fun updatePoolObservation(
         visionGrid: List<Float>,
         stateHash: String,
@@ -137,7 +156,9 @@ object BotServiceBridge {
         turnOwnerLabel: String = if (isMyTurn) "BOT TURN" else "WAIT",
         detectedSuitLabel: String = "OPEN",
         effectiveSuitLabel: String = "OPEN",
-        simulationSummary: String = "Scanning..."
+        simulationSummary: String = "Scanning...",
+        isTableLocked: Boolean = false,
+        tableLockLabel: String = if (isTableLocked) "LOCKED" else "Scanning..."
     ) {
         _telemetry.update {
             it.copy(
@@ -157,7 +178,9 @@ object BotServiceBridge {
                 plannedCutAngleDeg = cutAngleDeg,
                 plannedPowerFraction = plannedPowerFraction,
                 poolAnalysisSummary = summary,
-                simulationSummary = simulationSummary
+                simulationSummary = simulationSummary,
+                isTableLocked = isTableLocked,
+                tableLockLabel = tableLockLabel
             )
         }
     }

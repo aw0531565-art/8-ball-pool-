@@ -52,6 +52,30 @@ data class PlannedPoolShot(
     val isBankShot: Boolean = false
 )
 
+data class LockedTableGeometry(
+    val captureW: Int,
+    val captureH: Int,
+    val aspectRatio: Float,
+    val feltHsv: FloatArray,
+    val bounds: List<Float>,
+    val pockets: List<PoolPocket>
+)
+
+enum class AimFeedbackStatus {
+    CONFIRMED_LEGAL_WHITE_GUIDE,
+    FORBIDDEN_RED_MARKER,
+    NO_CLEAR_AIM_FEEDBACK
+}
+
+data class AimFeedbackResult(
+    val status: AimFeedbackStatus,
+    val redForbiddenScore: Float,
+    val whiteRingScore: Float,
+    val whiteGuideScore: Float,
+    val guideAngleErrorDeg: Float = 0f,
+    val note: String = ""
+)
+
 data class PoolFrameAnalysis(
     val isMyTurn: Boolean,
     val turnOwner: TurnOwner,
@@ -73,7 +97,9 @@ data class PoolFrameAnalysis(
     val visionGrid: List<Float>,
     val summary: String,
     val detectedTableBounds: List<Float> = listOf(0.192f, 0.222f, 0.798f, 0.908f),
-    val aspectRatio: Float = 2.0f
+    val aspectRatio: Float = 2.0f,
+    val tableLocked: Boolean = false,
+    val detectedGeometry: LockedTableGeometry? = null
 ) {
     val allTableTargets: List<DetectedBall>
         get() = targetBalls + listOfNotNull(eightBall)
@@ -82,12 +108,12 @@ data class PoolFrameAnalysis(
 /**
  * Computer-vision analyzer for Pool / Billiards mobile game screenshots and
  * live MediaProjection frames.
- * - Dynamically detects each player's assigned suit (Solids 1-7 vs Stripes 9-15 vs 8-Ball vs Open)
- *   from both HUD racks by separating inner number circles from outer white/colored caps.
- * - Detects all balls at 144x81 felt resolution with cluster splitting for touching balls,
- *   then classifies Solid vs Stripe vs 8-Ball vs Cue using a dense full-resolution disc patch.
- * - Runs forward 2D multi-ball physics simulation on the planned shot so cue, target, and
- *   secondary collided ball trajectories are predicted in advance.
+ * - Supports one-time Table Geometry Locking (per capture resolution / orientation) so
+ *   detected cushions and 6 pockets never drift mid-match, auto-unlocking on rotation.
+ * - Dynamically detects assigned suit (Solids 1-7 vs Stripes 9-15 vs 8-Ball vs Open)
+ *   from both bright and dimmed HUD racks.
+ * - Strictly filters circular round balls (rejecting cue sticks & white aim lines) up to 16 balls.
+ * - Inspects live game cue-aim feedback (Red ⊘ forbidden symbol vs White aiming ring & guideline).
  */
 object PoolVisionAnalyzer {
 
@@ -96,7 +122,8 @@ object PoolVisionAnalyzer {
     private data class RackScanResult(
         val occupiedSlots: Int,
         val isStripesScore: Float,
-        val occupiedRatio: Float
+        val occupiedRatio: Float,
+        val avgLuminance: Float
     )
 
     private data class BallPatchStats(
@@ -105,6 +132,8 @@ object PoolVisionAnalyzer {
         val outerWhiteFrac: Float,
         val outerColorFrac: Float,
         val darkFrac: Float,
+        val discNonFeltFrac: Float,
+        val feltHaloFrac: Float,
         val colorTag: String
     )
 
@@ -113,7 +142,9 @@ object PoolVisionAnalyzer {
         profile: TrainingProfileEntity,
         seatOverride: String? = null,
         suitOverride: String? = null,
-        failedShotPenalties: Map<String, Float> = emptyMap()
+        failedShotPenalties: Map<String, Float> = emptyMap(),
+        lockedTable: LockedTableGeometry? = null,
+        blockedTargetsIso: List<Pair<Float, Float>> = emptyList()
     ): PoolFrameAnalysis {
         val w = bitmap.width.coerceAtLeast(1)
         val h = bitmap.height.coerceAtLeast(1)
@@ -179,27 +210,65 @@ object PoolVisionAnalyzer {
         val greenTurnRatio = if (effectiveSeat == "RIGHT") rightGreenRatio else leftGreenRatio
         val pottedRatio = botRack.occupiedRatio
 
-        // 3. Estimate table felt color & visually detect inner cushion borders + 6 black pocket holes
-        val seedFLeft = (tLeft + 0.032f).coerceAtMost(tRight - 0.20f)
-        val seedFRight = (tRight - 0.032f).coerceAtLeast(seedFLeft + 0.20f)
-        val seedFTop = (tTop + 0.042f).coerceAtMost(tBottom - 0.20f)
-        val seedFBottom = (tBottom - 0.042f).coerceAtLeast(seedFTop + 0.20f)
+        // 3. Use locked table geometry for the current screen orientation if valid; otherwise detect & validate
+        val activeLock = lockedTable?.takeIf { lock ->
+            lock.captureW == w &&
+                lock.captureH == h &&
+                abs(lock.aspectRatio - aspectRatio) < 0.08f &&
+                lock.bounds.size == 4 &&
+                lock.pockets.size == 6
+        }
+        val useLocked = activeLock != null
 
-        val feltHsv = estimateFeltColorHsv(bitmap, seedFLeft, seedFTop, seedFRight, seedFBottom)
-        val (fLeft, fTop, fRight, fBottom) = detectInnerFeltBorders(
-            bitmap = bitmap,
-            feltHsv = feltHsv,
-            seedLeft = seedFLeft,
-            seedTop = seedFTop,
-            seedRight = seedFRight,
-            seedBottom = seedFBottom
-        )
+        val feltHsv: FloatArray
+        val fLeft: Float
+        val fTop: Float
+        val fRight: Float
+        val fBottom: Float
+        val pockets: List<PoolPocket>
+        var confirmedPocketsCount = 6
+        var feltConsistency = 1.0f
 
-        val pockets = detectSixPockets(bitmap, fLeft, fTop, fRight, fBottom)
+        if (activeLock != null) {
+            feltHsv = activeLock.feltHsv
+            fLeft = activeLock.bounds[0]
+            fTop = activeLock.bounds[1]
+            fRight = activeLock.bounds[2]
+            fBottom = activeLock.bounds[3]
+            pockets = activeLock.pockets
+        } else {
+            val seedFLeft = (tLeft + 0.032f).coerceAtMost(tRight - 0.20f)
+            val seedFRight = (tRight - 0.032f).coerceAtLeast(seedFLeft + 0.20f)
+            val seedFTop = (tTop + 0.042f).coerceAtMost(tBottom - 0.20f)
+            val seedFBottom = (tBottom - 0.042f).coerceAtLeast(seedFTop + 0.20f)
 
-        // 4. High-Resolution 144x81 interior felt scan
-        val cols = 144
-        val rows = 81
+            val (estHsv, consistency) = estimateFeltColorAndConsistency(bitmap, seedFLeft, seedFTop, seedFRight, seedFBottom)
+            feltHsv = estHsv
+            feltConsistency = consistency
+
+            val borders = detectInnerFeltBorders(
+                bitmap = bitmap,
+                feltHsv = feltHsv,
+                seedLeft = seedFLeft,
+                seedTop = seedFTop,
+                seedRight = seedFRight,
+                seedBottom = seedFBottom
+            )
+            fLeft = borders[0]
+            fTop = borders[1]
+            fRight = borders[2]
+            fBottom = borders[3]
+
+            val (detPockets, confirmed) = detectSixPocketsWithCount(bitmap, fLeft, fTop, fRight, fBottom)
+            pockets = detPockets
+            confirmedPocketsCount = confirmed
+        }
+
+        // 4. High-Resolution interior felt scan (adapts grid orientation for landscape vs rotated portrait)
+        val isPortrait = aspectRatio < 1.0f
+        val ballRadiusIso = if (isPortrait) BALL_RADIUS_ISO * aspectRatio else BALL_RADIUS_ISO
+        val cols = if (isPortrait) 81 else 144
+        val rows = if (isPortrait) 144 else 81
         val totalCells = cols * rows
         val cellSat = FloatArray(totalCells)
         val cellLum = FloatArray(totalCells)
@@ -219,7 +288,7 @@ object PoolVisionAnalyzer {
                 cellSat[idx] = hsv[1]
                 cellLum[idx] = hsv[2]
 
-                val nearPocket = pockets.any { isoDist(nx, ny, it.normX, it.normY, aspectRatio) < 0.039f }
+                val nearPocket = pockets.any { isoDist(nx, ny, it.normX, it.normY, aspectRatio) < ballRadiusIso * 1.75f }
                 if (nearPocket) continue
 
                 val hueDiff = abs(hsv[0] - feltHsv[0]).let { minOf(it, 360f - it) }
@@ -265,20 +334,31 @@ object PoolVisionAnalyzer {
             fTop = fTop,
             fRight = fRight,
             fBottom = fBottom,
-            aspectRatio = aspectRatio
+            aspectRatio = aspectRatio,
+            ballRadiusIso = ballRadiusIso
         )
 
-        // 6. Classify every candidate center from full-resolution bitmap disc patch (inner vs outer ring)
-        val patchCandidates = candidateCenters.map { (nx, ny) ->
-            val stats = sampleFullResBallPatch(bitmap, nx, ny, aspectRatio)
+        // 6. Classify every candidate center from full-resolution bitmap disc patch,
+        // filtering out thin cue-stick/aim-line artifacts so we only track real round balls (max 16).
+        val patchCandidates = candidateCenters.mapNotNull { (nx, ny) ->
+            val nearPocket = pockets.any { isoDist(nx, ny, it.normX, it.normY, aspectRatio) < ballRadiusIso * 1.32f }
+            if (nearPocket) return@mapNotNull null
+            if (nx < fLeft + 0.008f || nx > fRight - 0.008f || ny < fTop + 0.008f || ny > fBottom - 0.008f) {
+                return@mapNotNull null
+            }
+            val stats = sampleFullResBallPatch(bitmap, nx, ny, aspectRatio, feltHsv, ballRadiusIso)
+            if (stats.discNonFeltFrac < 0.48f) return@mapNotNull null
+            if (stats.feltHaloFrac < 0.25f && stats.discNonFeltFrac < 0.68f) return@mapNotNull null
             Triple(nx, ny, stats)
-        }
+        }.sortedByDescending { (_, _, st) ->
+            st.discNonFeltFrac * 1.4f + st.feltHaloFrac * 0.6f
+        }.take(16)
 
         // Identify the single best Cue Ball (highest pure-white score & lowest outer color band)
         var bestCueIdx = -1
         var bestCueScore = -1f
         patchCandidates.forEachIndexed { idx, (_, _, st) ->
-            if (st.totalWhiteFrac >= 0.58f && st.outerColorFrac < 0.22f && st.darkFrac < 0.25f) {
+            if (st.totalWhiteFrac >= 0.46f && st.outerColorFrac < 0.30f && st.darkFrac < 0.25f) {
                 val cueScore = st.totalWhiteFrac * 2.4f - st.outerColorFrac * 2.2f - st.darkFrac * 1.5f
                 if (cueScore > bestCueScore) {
                     bestCueScore = cueScore
@@ -329,11 +409,19 @@ object PoolVisionAnalyzer {
 
         val eightBall = detectedTargets.firstOrNull { it.kind == DetectedBallKind.EIGHT_BALL }
         val allColoredTargets = detectedTargets.filter { it.kind == DetectedBallKind.TARGET }
-        val legalTargets = filterLegalTargets(
+        val rawLegalTargets = filterLegalTargets(
             effectiveSuit = effectiveSuit,
             targets = allColoredTargets,
             eightBall = eightBall
         )
+        val legalTargets = if (blockedTargetsIso.isEmpty()) {
+            rawLegalTargets
+        } else {
+            val unblocked = rawLegalTargets.filter { cand ->
+                blockedTargetsIso.none { (bx, by) -> isoDist(cand.normX, cand.normY, bx, by, aspectRatio) < 0.032f }
+            }
+            unblocked.ifEmpty { rawLegalTargets }
+        }
         val obstacleBalls = allColoredTargets + listOfNotNull(eightBall)
         val tableBounds = listOf(fLeft, fTop, fRight, fBottom)
 
@@ -354,7 +442,7 @@ object PoolVisionAnalyzer {
 
         val simPrediction = if (cueBall != null && planned != null) {
             PoolPhysicsSimulator.simulateShot(
-                cueBall = cueBall!!,
+                cueBall = cueBall,
                 allBalls = obstacleBalls,
                 primaryTarget = planned.targetBall,
                 aimPointX = planned.aimPointX,
@@ -378,8 +466,27 @@ object PoolVisionAnalyzer {
             else -> "WAIT"
         }
 
+        val tableSpanOk = (fRight - fLeft) >= 0.45f && (fBottom - fTop) >= 0.48f
+        val detectedGeometry = if (useLocked) {
+            lockedTable
+        } else if (tableSpanOk && confirmedPocketsCount >= 4 && feltConsistency >= 0.45f &&
+            (cueBall != null || detectedTargets.size >= 2)
+        ) {
+            LockedTableGeometry(
+                captureW = w,
+                captureH = h,
+                aspectRatio = aspectRatio,
+                feltHsv = feltHsv,
+                bounds = tableBounds,
+                pockets = pockets
+            )
+        } else {
+            null
+        }
+
         val summary = buildString {
             append(turnTag)
+            if (useLocked || detectedGeometry != null) append(" [LOCK]")
             append(" • ${effectiveSuit.name} (${botRack.occupiedSlots}/${oppRack.occupiedSlots})")
             append(" | Cue:${if (cueBall != null) "OK" else "N/A"}")
             append(" | S:$solidsCount St:$stripesCount")
@@ -410,7 +517,9 @@ object PoolVisionAnalyzer {
             visionGrid = visionGrid,
             summary = summary,
             detectedTableBounds = tableBounds,
-            aspectRatio = aspectRatio
+            aspectRatio = aspectRatio,
+            tableLocked = useLocked || detectedGeometry != null,
+            detectedGeometry = detectedGeometry
         )
     }
 
@@ -423,7 +532,8 @@ object PoolVisionAnalyzer {
         fTop: Float,
         fRight: Float,
         fBottom: Float,
-        aspectRatio: Float
+        aspectRatio: Float,
+        ballRadiusIso: Float = BALL_RADIUS_ISO
     ): List<Pair<Float, Float>> {
         val visited = BooleanArray(cols * rows)
         val queue = IntArray(cols * rows)
@@ -484,7 +594,7 @@ object PoolVisionAnalyzer {
                     }
                     val nx = fLeft + (((sumC / count) + 0.5f) / cols) * (fRight - fLeft)
                     val ny = fTop + (((sumR / count) + 0.5f) / rows) * (fBottom - fTop)
-                    if (centers.none { isoDist(nx, ny, it.first, it.second, aspectRatio) < 0.028f }) {
+                    if (centers.none { isoDist(nx, ny, it.first, it.second, aspectRatio) < ballRadiusIso * 1.28f }) {
                         centers.add(nx to ny)
                     }
                 }
@@ -508,8 +618,8 @@ object PoolVisionAnalyzer {
 
                 val localCenters = mutableListOf<Pair<Float, Float>>()
                 for ((nx, ny, _) in scoredCells) {
-                    val farFromLocal = localCenters.none { isoDist(nx, ny, it.first, it.second, aspectRatio) < 0.030f }
-                    val farFromGlobal = centers.none { isoDist(nx, ny, it.first, it.second, aspectRatio) < 0.028f }
+                    val farFromLocal = localCenters.none { isoDist(nx, ny, it.first, it.second, aspectRatio) < ballRadiusIso * 1.36f }
+                    val farFromGlobal = centers.none { isoDist(nx, ny, it.first, it.second, aspectRatio) < ballRadiusIso * 1.28f }
                     if (farFromLocal && farFromGlobal) {
                         localCenters.add(nx to ny)
                         centers.add(nx to ny)
@@ -525,7 +635,9 @@ object PoolVisionAnalyzer {
         bitmap: Bitmap,
         normX: Float,
         normY: Float,
-        aspectRatio: Float
+        aspectRatio: Float,
+        feltHsv: FloatArray,
+        ballRadiusIso: Float = BALL_RADIUS_ISO
     ): BallPatchStats {
         val w = bitmap.width
         val h = bitmap.height
@@ -534,6 +646,7 @@ object PoolVisionAnalyzer {
         var totalSamples = 0
         var whiteSamples = 0
         var darkSamples = 0
+        var nonFeltSamples = 0
         var outerSamples = 0
         var outerWhiteSamples = 0
         var outerColorSamples = 0
@@ -542,7 +655,7 @@ object PoolVisionAnalyzer {
         var repColor = Color.GRAY
         val hueBins = IntArray(7) // 0=Yellow, 1=Blue, 2=Red, 3=Purple, 4=Orange, 5=Green, 6=Maroon
 
-        val rIso = BALL_RADIUS_ISO * 0.94f
+        val rIso = ballRadiusIso * 0.94f
         val gridSteps = -4..4
         for (ryIdx in gridSteps) {
             val dyNorm = ryIdx / 4f
@@ -567,6 +680,10 @@ object PoolVisionAnalyzer {
                 val isDark = lum < 0.23f && sat < 0.45f
                 val isVivid = sat > 0.34f && lum > 0.17f
 
+                val hueDiff = abs(hue - feltHsv[0]).let { minOf(it, 360f - it) }
+                val differsFromFelt = hueDiff > 22f || abs(sat - feltHsv[1]) > 0.24f || abs(lum - feltHsv[2]) > 0.22f
+                if (differsFromFelt) nonFeltSamples++
+
                 if (isWhite) whiteSamples++
                 if (isDark) darkSamples++
 
@@ -585,6 +702,23 @@ object PoolVisionAnalyzer {
                     val bin = classifyColorBin(hue, lum)
                     if (bin in hueBins.indices) hueBins[bin]++
                 }
+            }
+        }
+
+        // 8-point felt halo ring at r = 1.48 * ballRadiusIso to distinguish round balls from straight cue sticks/lines
+        var haloFeltCount = 0
+        val haloRadius = ballRadiusIso * 1.48f
+        for (k in 0 until 8) {
+            val angle = k * (PI / 4.0)
+            val hx = (normX + (cos(angle).toFloat() * haloRadius) / aspectRatio).coerceIn(0.01f, 0.99f)
+            val hy = (normY + sin(angle).toFloat() * haloRadius).coerceIn(0.01f, 0.99f)
+            Color.colorToHSV(
+                bitmap.getPixel((hx * w).toInt().coerceIn(0, w - 1), (hy * h).toInt().coerceIn(0, h - 1)),
+                hsv
+            )
+            val hueDiff = abs(hsv[0] - feltHsv[0]).let { minOf(it, 360f - it) }
+            if (hueDiff < 28f && abs(hsv[1] - feltHsv[1]) < 0.32f && abs(hsv[2] - feltHsv[2]) < 0.32f) {
+                haloFeltCount++
             }
         }
 
@@ -610,6 +744,8 @@ object PoolVisionAnalyzer {
             outerWhiteFrac = outerWhiteSamples / outerDenom,
             outerColorFrac = outerColorSamples / outerDenom,
             darkFrac = darkSamples / totalDenom,
+            discNonFeltFrac = nonFeltSamples / totalDenom,
+            feltHaloFrac = haloFeltCount / 8f,
             colorTag = colorTag
         )
     }
@@ -673,6 +809,8 @@ object PoolVisionAnalyzer {
         val hsv = FloatArray(3)
         var occupied = 0
         var stripeVotes = 0f
+        var lumSum = 0f
+        var lumCount = 0
 
         val slotStart = (leftX + 0.011f).coerceIn(0.05f, 0.90f)
         val slotEnd = (rightX - 0.011f).coerceIn(slotStart + 0.05f, 0.95f)
@@ -687,6 +825,8 @@ object PoolVisionAnalyzer {
             var brightInnerPixels = 0
             var capWhitePixels = 0
             var outerColorPixels = 0
+            var slotLumSum = 0f
+            var slotLumCount = 0
 
             for (dyIdx in -4..4) {
                 val dyNorm = dyIdx / 4f
@@ -697,17 +837,24 @@ object PoolVisionAnalyzer {
                     if (rNorm > 0.95f) continue
 
                     val px = ((sx + dxNorm * rx) * w).toInt().coerceIn(0, w - 1)
-                    Color.colorToHSV(bitmap.getPixel(px, py), hsv)
+                    val pixel = bitmap.getPixel(px, py)
+                    Color.colorToHSV(pixel, hsv)
                     val s = hsv[1]
                     val v = hsv[2]
+                    val r = Color.red(pixel)
+                    val g = Color.green(pixel)
+                    val b = Color.blue(pixel)
+                    val chroma = maxOf(r, g, b) - minOf(r, g, b)
+                    slotLumSum += v
+                    slotLumCount++
 
-                    val isColor = s > 0.34f && v > 0.16f
-                    val isWhite = s < 0.27f && v > 0.56f
+                    // Supports both active bright rack and waiting dimmed rack, while rejecting dark charcoal empty slots
+                    val isColor = s > 0.30f && v > 0.16f && chroma >= 26
+                    val isWhite = s < 0.28f && v > 0.30f
 
                     if (isColor) vividPixels++
-                    if (rNorm < 0.45f && v > 0.36f) brightInnerPixels++
+                    if (rNorm < 0.45f && v > 0.24f) brightInnerPixels++
 
-                    // Outer top/bottom caps vs outer colored ring: separates Stripes (white caps) from Solids (solid color ring)
                     if (rNorm >= 0.46f) {
                         if (isColor) outerColorPixels++
                         if (abs(dyNorm) >= 0.48f && isWhite) capWhitePixels++
@@ -715,11 +862,14 @@ object PoolVisionAnalyzer {
                 }
             }
 
-            // Empty HUD slots are dark charcoal circles (vividPixels <= 2 and brightInnerPixels <= 2)
-            if (vividPixels >= 5 || (vividPixels >= 3 && brightInnerPixels >= 3)) {
+            if (vividPixels >= 4 || (vividPixels >= 3 && brightInnerPixels >= 3)) {
                 occupied++
+                if (slotLumCount > 0) {
+                    lumSum += slotLumSum / slotLumCount
+                    lumCount++
+                }
                 when {
-                    capWhitePixels >= 3 && capWhitePixels >= outerColorPixels * 0.45f -> stripeVotes += 1f
+                    capWhitePixels >= 3 && capWhitePixels >= outerColorPixels * 0.42f -> stripeVotes += 1f
                     outerColorPixels >= capWhitePixels * 2 && outerColorPixels >= 5 -> stripeVotes -= 1f
                     capWhitePixels >= 2 -> stripeVotes += 0.5f
                     else -> stripeVotes -= 0.5f
@@ -728,10 +878,12 @@ object PoolVisionAnalyzer {
         }
 
         val normScore = if (occupied > 0) stripeVotes / occupied else 0f
+        val avgLum = if (lumCount > 0) lumSum / lumCount else 0f
         return RackScanResult(
             occupiedSlots = occupied,
             isStripesScore = normScore,
-            occupiedRatio = occupied / 7f
+            occupiedRatio = occupied / 7f,
+            avgLuminance = avgLum
         )
     }
 
@@ -742,20 +894,26 @@ object PoolVisionAnalyzer {
         if (botRack.occupiedSlots == 0 && oppRack.occupiedSlots >= 1) {
             return AssignedSuit.EIGHT_BALL
         }
-        // When opponent also has remaining balls, use differential score (always opposite suits!)
+        // Weight bright/active rack slightly more than dimmed waiting rack when combining differential scores
         val combinedScore = if (oppRack.occupiedSlots >= 1) {
-            (botRack.isStripesScore - oppRack.isStripesScore) * 0.5f
+            val botW = if (botRack.avgLuminance >= oppRack.avgLuminance) 0.62f else 0.45f
+            val oppW = 1.0f - botW
+            botRack.isStripesScore * botW - oppRack.isStripesScore * oppW
         } else {
             botRack.isStripesScore
         }
         return when {
-            combinedScore >= 0.12f -> AssignedSuit.STRIPES
-            combinedScore <= -0.12f -> AssignedSuit.SOLIDS
+            combinedScore >= 0.10f -> AssignedSuit.STRIPES
+            combinedScore <= -0.10f -> AssignedSuit.SOLIDS
             botRack.isStripesScore >= 0f -> AssignedSuit.STRIPES
             else -> AssignedSuit.SOLIDS
         }
     }
 
+    /**
+     * Scans only near the expected cushion border band [seed +/- 0.05] outward from felt into wood rail,
+     * requiring a persistent non-felt run so interior balls or cue sticks can never shrink the table!
+     */
     private fun detectInnerFeltBorders(
         bitmap: Bitmap,
         feltHsv: FloatArray,
@@ -778,11 +936,8 @@ object PoolVisionAnalyzer {
             return hueDiff < 26f && satDiff < 0.30f && valDiff < 0.30f
         }
 
-        val midX = (seedLeft + seedRight) * 0.5f
-        val midY = (seedTop + seedBottom) * 0.5f
-
         fun scanEdgeX(startX: Float, endX: Float, step: Float): Float? {
-            val ys = listOf(0.35f, 0.45f, 0.56f, 0.67f, 0.78f)
+            val ys = listOf(0.32f, 0.44f, 0.56f, 0.68f, 0.78f)
             val hits = mutableListOf<Float>()
             for (y in ys) {
                 var x = startX
@@ -790,8 +945,9 @@ object PoolVisionAnalyzer {
                 while (if (step > 0) x <= endX else x >= endX) {
                     if (!isFeltPixel(x, y)) {
                         nonFeltRun++
-                        if (nonFeltRun >= 2) {
-                            hits.add(x - step)
+                        // Confirm outward cushion stays non-felt beyond a ball diameter
+                        if (nonFeltRun >= 3 && !isFeltPixel((x + step * 4f).coerceIn(0.02f, 0.98f), y)) {
+                            hits.add(x - step * 2f)
                             break
                         }
                     } else {
@@ -806,7 +962,7 @@ object PoolVisionAnalyzer {
         }
 
         fun scanEdgeY(startY: Float, endY: Float, step: Float): Float? {
-            val xs = listOf(0.32f, 0.42f, 0.50f, 0.58f, 0.68f)
+            val xs = listOf(0.28f, 0.39f, 0.50f, 0.61f, 0.72f)
             val hits = mutableListOf<Float>()
             for (x in xs) {
                 var y = startY
@@ -814,8 +970,8 @@ object PoolVisionAnalyzer {
                 while (if (step > 0) y <= endY else y >= endY) {
                     if (!isFeltPixel(x, y)) {
                         nonFeltRun++
-                        if (nonFeltRun >= 2) {
-                            hits.add(y - step)
+                        if (nonFeltRun >= 3 && !isFeltPixel(x, (y + step * 4f).coerceIn(0.05f, 0.99f))) {
+                            hits.add(y - step * 2f)
                             break
                         }
                     } else {
@@ -829,13 +985,13 @@ object PoolVisionAnalyzer {
             return hits[hits.size / 2]
         }
 
-        val detLeft = scanEdgeX(midX - 0.14f, (seedLeft - 0.04f).coerceAtLeast(0.08f), -0.004f)
+        val detLeft = scanEdgeX((seedLeft + 0.055f).coerceAtMost(0.45f), (seedLeft - 0.045f).coerceAtLeast(0.08f), -0.004f)
             ?.coerceIn(seedLeft - 0.035f, seedLeft + 0.035f) ?: seedLeft
-        val detRight = scanEdgeX(midX + 0.14f, (seedRight + 0.04f).coerceAtMost(0.92f), +0.004f)
+        val detRight = scanEdgeX((seedRight - 0.055f).coerceAtLeast(0.55f), (seedRight + 0.045f).coerceAtMost(0.92f), +0.004f)
             ?.coerceIn(seedRight - 0.035f, seedRight + 0.035f) ?: seedRight
-        val detTop = scanEdgeY(midY - 0.14f, (seedTop - 0.04f).coerceAtLeast(0.12f), -0.005f)
+        val detTop = scanEdgeY((seedTop + 0.060f).coerceAtMost(0.45f), (seedTop - 0.045f).coerceAtLeast(0.12f), -0.005f)
             ?.coerceIn(seedTop - 0.035f, seedTop + 0.035f) ?: seedTop
-        val detBottom = scanEdgeY(midY + 0.14f, (seedBottom + 0.04f).coerceAtMost(0.97f), +0.005f)
+        val detBottom = scanEdgeY((seedBottom - 0.060f).coerceAtLeast(0.55f), (seedBottom + 0.045f).coerceAtMost(0.97f), +0.005f)
             ?.coerceIn(seedBottom - 0.035f, seedBottom + 0.035f) ?: seedBottom
 
         return listOf(
@@ -846,13 +1002,13 @@ object PoolVisionAnalyzer {
         )
     }
 
-    private fun detectSixPockets(
+    private fun detectSixPocketsWithCount(
         bitmap: Bitmap,
         fLeft: Float,
         fTop: Float,
         fRight: Float,
         fBottom: Float
-    ): List<PoolPocket> {
+    ): Pair<List<PoolPocket>, Int> {
         val w = bitmap.width
         val h = bitmap.height
         val hsv = FloatArray(3)
@@ -865,7 +1021,8 @@ object PoolVisionAnalyzer {
             PoolPocket("BR", fRight - 0.006f, fBottom - 0.010f)
         )
 
-        return seeds.map { seed ->
+        var confirmed = 0
+        val resolved = seeds.map { seed ->
             var sumX = 0f
             var sumY = 0f
             var darkCount = 0
@@ -884,11 +1041,13 @@ object PoolVisionAnalyzer {
                 }
             }
             if (darkCount >= 5) {
+                confirmed++
                 PoolPocket(seed.id, sumX / darkCount, sumY / darkCount)
             } else {
                 seed
             }
         }
+        return resolved to confirmed
     }
 
     fun filterLegalTargets(
@@ -1217,33 +1376,195 @@ object PoolVisionAnalyzer {
         return hypot(pxI - projX, py - projY)
     }
 
-    private fun estimateFeltColorHsv(
+    /**
+     * Inspects the live aiming indicator around [targetBall] right after orienting the cue stick:
+     * - Detects the Red `⊘` prohibition icon above/on opponent or illegal balls -> FORBIDDEN_RED_MARKER
+     * - Detects the bright White aiming ring & forward target-ball guideline -> CONFIRMED_LEGAL_WHITE_GUIDE
+     *   and measures guide-line angular error relative to [intendedPocket].
+     */
+    fun inspectAimFeedback(
+        bitmap: Bitmap,
+        cueBall: DetectedBall,
+        targetBall: DetectedBall,
+        intendedPocket: PoolPocket,
+        aspectRatio: Float = 2.0f
+    ): AimFeedbackResult {
+        val w = bitmap.width.coerceAtLeast(1)
+        val h = bitmap.height.coerceAtLeast(1)
+        val safeAspect = aspectRatio.coerceIn(0.45f, 2.50f)
+        val hsv = FloatArray(3)
+
+        val radIso = if (safeAspect < 1.0f) BALL_RADIUS_ISO * safeAspect else BALL_RADIUS_ISO
+
+        // 1. Scan upper badge halo strictly above top rim of target ball for the bright Red `⊘` symbol
+        var redBadgeHits = 0
+        var redBadgeTotal = 0
+        var blackOutlineHits = 0
+        val tx = targetBall.normX
+        val ty = targetBall.normY
+
+        for (dyStep in -5..-1) {
+            // dyStep in [-5..-1] covers [-2.56*R .. -0.80*R] above ball center (strictly above target ball body)
+            val dyIso = (dyStep * 0.44f - 0.36f) * radIso
+            val sy = (ty + dyIso).coerceIn(0.01f, 0.99f)
+            val py = (sy * h).toInt().coerceIn(0, h - 1)
+            for (dxStep in -4..4) {
+                val dxIso = (dxStep * 0.30f) * radIso
+                // Never count pixels overlapping the target ball itself (crucial for Solid #3 / Maroon #7)
+                val distFromCenter = hypot(dxIso, dyIso)
+                if (distFromCenter < radIso * 1.15f) continue
+                val sx = (tx + dxIso / safeAspect).coerceIn(0.01f, 0.99f)
+                val px = (sx * w).toInt().coerceIn(0, w - 1)
+                val p = bitmap.getPixel(px, py)
+                Color.colorToHSV(p, hsv)
+                redBadgeTotal++
+                val isCrimsonIcon = (hsv[0] <= 14f || hsv[0] >= 344f) &&
+                    hsv[1] >= 0.62f && hsv[2] >= 0.58f &&
+                    Color.red(p) >= 175 && Color.green(p) <= 75 && Color.blue(p) <= 75
+                if (isCrimsonIcon) redBadgeHits++
+                if (hsv[2] < 0.16f && hsv[1] < 0.55f) blackOutlineHits++
+            }
+        }
+        val redForbiddenScore = if (redBadgeTotal > 0) redBadgeHits.toFloat() / redBadgeTotal else 0f
+
+        // 2. Scan White Aiming Circle around ghost impact point & White forward target guideline
+        val ctDx = (tx - cueBall.normX) * safeAspect
+        val ctDy = ty - cueBall.normY
+        val ctLen = hypot(ctDx, ctDy).coerceAtLeast(0.01f)
+        val fwdX = ctDx / ctLen
+        val fwdY = ctDy / ctLen
+
+        val ghostX = (tx * safeAspect - fwdX * radIso * 1.95f) / safeAspect
+        val ghostY = ty - fwdY * radIso * 1.95f
+        var ringWhiteHits = 0
+        val ringSamples = 16
+        for (k in 0 until ringSamples) {
+            val ang = k * (2.0 * PI / ringSamples)
+            val rx = (ghostX + (cos(ang).toFloat() * radIso * 0.96f) / safeAspect).coerceIn(0.01f, 0.99f)
+            val ry = (ghostY + sin(ang).toFloat() * radIso * 0.96f).coerceIn(0.01f, 0.99f)
+            Color.colorToHSV(
+                bitmap.getPixel((rx * w).toInt().coerceIn(0, w - 1), (ry * h).toInt().coerceIn(0, h - 1)),
+                hsv
+            )
+            if (hsv[2] >= 0.78f && hsv[1] <= 0.25f) ringWhiteHits++
+        }
+        val whiteRingScore = ringWhiteHits.toFloat() / ringSamples
+
+        // Scan forward white guideline rays around the cue->target axis (-52° .. +52° in 4° steps)
+        val baseAngle = atan2(fwdY.toDouble(), fwdX.toDouble())
+        val pocketAngle = atan2(
+            (intendedPocket.normY - ty).toDouble(),
+            ((intendedPocket.normX - tx) * safeAspect).toDouble()
+        )
+        var bestRayHits = 0
+        var bestRayAngleRad = baseAngle
+        for (degOffset in -52..52 step 4) {
+            val ang = baseAngle + degOffset * (PI / 180.0)
+            val cosA = cos(ang).toFloat()
+            val sinA = sin(ang).toFloat()
+            var hits = 0
+            for (step in 1..10) {
+                val r = radIso * (1.35f + step * 0.42f)
+                val sx = (tx + (cosA * r) / safeAspect).coerceIn(0.01f, 0.99f)
+                val sy = (ty + sinA * r).coerceIn(0.01f, 0.99f)
+                Color.colorToHSV(
+                    bitmap.getPixel((sx * w).toInt().coerceIn(0, w - 1), (sy * h).toInt().coerceIn(0, h - 1)),
+                    hsv
+                )
+                if (hsv[2] >= 0.78f && hsv[1] <= 0.25f) hits++
+            }
+            if (hits > bestRayHits) {
+                bestRayHits = hits
+                bestRayAngleRad = ang
+            }
+        }
+        val whiteGuideScore = bestRayHits / 10f
+        val angleDiffDeg = (((bestRayAngleRad - pocketAngle) * 180.0 / PI).toFloat()).let { d ->
+            var n = d
+            while (n > 180f) n -= 360f
+            while (n < -180f) n += 360f
+            n
+        }
+
+        val strongRedForbiddenBadge = (redBadgeHits >= 5 && blackOutlineHits >= 2 && whiteGuideScore < 0.45f) ||
+            (redBadgeHits >= 6 && redForbiddenScore >= 0.16f && whiteGuideScore < 0.45f)
+        val status = when {
+            strongRedForbiddenBadge ->
+                AimFeedbackStatus.FORBIDDEN_RED_MARKER
+            bestRayHits >= 4 || (whiteRingScore >= 0.28f && bestRayHits >= 3) ->
+                AimFeedbackStatus.CONFIRMED_LEGAL_WHITE_GUIDE
+            else ->
+                AimFeedbackStatus.NO_CLEAR_AIM_FEEDBACK
+        }
+
+        val note = when (status) {
+            AimFeedbackStatus.FORBIDDEN_RED_MARKER ->
+                "Red ⊘ icon detected (${redBadgeHits} hits) -> NOT my ball"
+            AimFeedbackStatus.CONFIRMED_LEGAL_WHITE_GUIDE ->
+                "White aim guide confirmed (ray=${bestRayHits}/10, err=${"%.1f".format(angleDiffDeg)}°)"
+            AimFeedbackStatus.NO_CLEAR_AIM_FEEDBACK ->
+                "No white guide yet (ring=${(whiteRingScore * 100).toInt()}%, ray=${bestRayHits})"
+        }
+
+        return AimFeedbackResult(
+            status = status,
+            redForbiddenScore = redForbiddenScore,
+            whiteRingScore = whiteRingScore,
+            whiteGuideScore = whiteGuideScore,
+            guideAngleErrorDeg = angleDiffDeg,
+            note = note
+        )
+    }
+
+    private fun estimateFeltColorAndConsistency(
         bitmap: Bitmap,
         tLeft: Float,
         tTop: Float,
         tRight: Float,
         tBottom: Float
-    ): FloatArray {
+    ): Pair<FloatArray, Float> {
         val w = bitmap.width
         val h = bitmap.height
         val hues = mutableListOf<Float>()
         val sats = mutableListOf<Float>()
         val vals = mutableListOf<Float>()
+        val samples = mutableListOf<FloatArray>()
         val hsv = FloatArray(3)
-        for (ry in listOf(0.28f, 0.50f, 0.72f)) {
-            for (rx in listOf(0.25f, 0.50f, 0.75f)) {
+        for (ry in listOf(0.22f, 0.40f, 0.60f, 0.78f)) {
+            for (rx in listOf(0.20f, 0.38f, 0.56f, 0.74f)) {
                 val px = ((tLeft + rx * (tRight - tLeft)) * w).toInt().coerceIn(0, w - 1)
                 val py = ((tTop + ry * (tBottom - tTop)) * h).toInt().coerceIn(0, h - 1)
                 Color.colorToHSV(bitmap.getPixel(px, py), hsv)
-                hues.add(hsv[0])
-                sats.add(hsv[1])
-                vals.add(hsv[2])
+                val copy = floatArrayOf(hsv[0], hsv[1], hsv[2])
+                samples.add(copy)
+                // Prefer colored felt pixels over white/black ball patches when taking median
+                if (hsv[1] >= 0.18f && hsv[2] in 0.16f..0.92f) {
+                    hues.add(hsv[0])
+                    sats.add(hsv[1])
+                    vals.add(hsv[2])
+                }
+            }
+        }
+        if (hues.isEmpty()) {
+            samples.forEach {
+                hues.add(it[0])
+                sats.add(it[1])
+                vals.add(it[2])
             }
         }
         hues.sort()
         sats.sort()
         vals.sort()
-        return floatArrayOf(hues[hues.size / 2], sats[sats.size / 2], vals[vals.size / 2])
+        val medH = hues[hues.size / 2]
+        val medS = sats[sats.size / 2]
+        val medV = vals[vals.size / 2]
+        val felt = floatArrayOf(medH, medS, medV)
+        val consistentCount = samples.count { s ->
+            val hDiff = abs(s[0] - medH).let { minOf(it, 360f - it) }
+            hDiff < 26f && abs(s[1] - medS) < 0.30f && abs(s[2] - medV) < 0.30f
+        }
+        val consistency = consistentCount.toFloat() / samples.size.coerceAtLeast(1)
+        return felt to consistency
     }
 
     private fun measureGreenBorderRatio(bitmap: Bitmap, centerX: Float, centerY: Float): Float {

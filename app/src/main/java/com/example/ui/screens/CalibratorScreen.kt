@@ -344,7 +344,7 @@ fun CalibratorScreen(
                             color = if (analysis.isMyTurn) EmeraldNeon else AmberPulse
                         )
                         Text(
-                            text = "TurnOwner: ${analysis.turnOwner.name} | HUD Suit: ${analysis.detectedSuit.name} (Bot:${analysis.botRackCount}, Opp:${analysis.oppRackCount}) | Green=Solid, Cyan=Stripe, Red=8, Magenta=2ndary",
+                            text = "TurnOwner: ${analysis.turnOwner.name} | Table:${if (analysis.tableLocked || analysis.detectedGeometry != null) "LOCK-READY" else "SCAN"} | HUD Suit: ${analysis.detectedSuit.name} (Bot:${analysis.botRackCount}, Opp:${analysis.oppRackCount}) | Green=Solid, Cyan=Stripe, Red=8, Magenta=2ndary",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

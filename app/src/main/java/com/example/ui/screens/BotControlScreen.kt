@@ -656,6 +656,11 @@ fun BotControlScreen(
                                 color = if (telemetry.isMyTurnDetected) EmeraldNeon else AmberPulse
                             )
                             Text(
+                                text = "Table: ${telemetry.tableLockLabel}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (telemetry.isTableLocked) EmeraldNeon else AmberPulse
+                            )
+                            Text(
                                 text = "Suit: ${telemetry.effectiveSuitLabel} (HUD: ${telemetry.detectedSuitLabel}) • Learned Human: ${telemetry.humanShotsObserved}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = CyanElectric
@@ -664,6 +669,15 @@ fun BotControlScreen(
                                 text = "Cue: ${if (telemetry.isCueBallDetected) "OK" else "Scan"} • Targets: ${telemetry.detectedTargetBallsCount} • Pkt: ${telemetry.plannedPocketId ?: "-"}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Aim: ${telemetry.aimFeedbackLabel}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = when {
+                                    telemetry.aimFeedbackLabel.contains("RED", ignoreCase = true) -> CrimsonAlert
+                                    telemetry.aimFeedbackLabel.contains("WHITE", ignoreCase = true) -> EmeraldNeon
+                                    else -> CyanElectric
+                                }
                             )
                             Text(
                                 text = "Pred: ${telemetry.simulationSummary}",
@@ -675,6 +689,19 @@ fun BotControlScreen(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            OutlinedButton(
+                                onClick = { com.example.service.BotServiceBridge.requestTableUnlock() },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("btn_unlock_table"),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = if (isUrdu) "ٹیبل دوبارہ لاک کریں" else "Re-lock Table",
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
                         } else {
                             Text(
                                 text = "UI Nodes: ${telemetry.clickableNodeCount}",

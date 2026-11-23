@@ -513,7 +513,8 @@ class BotFloatingOverlay(private val context: Context) {
         headerStatusText?.text = if (isPaused) "NeuroBot • PAUSED" else "NeuroBot • LIVE"
         headerStatusText?.setTextColor(accentColor)
 
-        turnSuitStatusText?.text = "${t.turnOwnerLabel} • Suit:${t.effectiveSuitLabel} • Human:${t.humanShotsObserved}"
+        val lockTag = if (t.isTableLocked) "LOCK✓" else "SCAN"
+        turnSuitStatusText?.text = "${t.turnOwnerLabel} • $lockTag • Suit:${t.effectiveSuitLabel}"
         turnSuitStatusText?.setTextColor(
             when {
                 t.isMyTurnDetected -> Color.parseColor("#10B981")
@@ -524,7 +525,8 @@ class BotFloatingOverlay(private val context: Context) {
 
         val cueMark = if (t.isCueBallDetected) "Cue✓" else "Cue✗"
         val pocketStr = t.plannedPocketId ?: "-"
-        visionStatusText?.text = "${t.captureSizeLabel} • $cueMark | Tgt:${t.detectedTargetBallsCount} | Pkt:$pocketStr\n${t.simulationSummary}"
+        val aimTag = if (t.aimFeedbackLabel != "Idle") " • ${t.aimFeedbackLabel}" else ""
+        visionStatusText?.text = "${t.captureSizeLabel} • $cueMark | Tgt:${t.detectedTargetBallsCount} | Pkt:$pocketStr$aimTag\n${t.simulationSummary}"
 
         val modeSuffix = if (t.manualPowerOverride != null) "Manual" else "AI Auto"
         forcePercentText?.text = "${forcePct}% ($modeSuffix)"
