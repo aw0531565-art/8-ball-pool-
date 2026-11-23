@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">NeuroBot</string>
+    <string name="accessibility_service_description">Reads active game screen structure and dispatches automated taps or swipes for your configured self-training bot profile.</string>
+    <string name="notif_channel_bot_name">NeuroBot Automation</string>
+    <string name="notif_channel_bot_desc">Live status and controls for screen reading and autonomous self-training.</string>
+    <string name="notif_title_active">NeuroBot Screen Reader Active</string>
+    <string name="notif_text_learning">Observing screen frames and updating on-device Q-memory.</string>
+    <string name="action_pause_bot">Pause</string>
+    <string name="action_resume_bot">Resume</string>
+    <string name="action_train_replay">Train Replay</string>
+    <string name="action_stop_bot">Stop</string>
+</resources>
